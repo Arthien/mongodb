@@ -4,7 +4,7 @@ defmodule Mongo.Protocol do
   alias Mongo.Protocol.Utils
 
   @timeout 5000
-  @find_flags ~w(tailable_cursor slave_ok no_cursor_timeout await_data exhaust allow_partial_results)a
+  @find_flags ~w(tailable_cursor slave_ok no_cursor_timeout await_data exhaust allow_partial_results oplog_replay)a
   @find_one_flags ~w(slave_ok exhaust partial)a
   @insert_flags ~w(continue_on_error)a
   @update_flags ~w(upsert)a
@@ -18,27 +18,29 @@ defmodule Mongo.Protocol do
     {write_concern, opts} = Keyword.split(opts, @write_concern)
     write_concern = Keyword.put_new(write_concern, :w, 1)
 
-    s = %{socket: nil,
-          request_id: 0,
-          timeout: opts[:timeout] || @timeout,
-          database: Keyword.fetch!(opts, :database),
-          write_concern: Map.new(write_concern),
-          wire_version: nil,
-          ssl: opts[:ssl] || false}
+    s = %{
+      socket: nil,
+      request_id: 0,
+      timeout: opts[:timeout] || @timeout,
+      database: Keyword.fetch!(opts, :database),
+      write_concern: Map.new(write_concern),
+      wire_version: nil,
+      ssl: opts[:ssl] || false
+    }
 
     connect(opts, s)
   end
 
   defp connect(opts, s) do
-    # TODO: with/else in elixir 1.3
     result =
       with {:ok, s} <- tcp_connect(opts, s),
            {:ok, s} <- maybe_ssl(opts, s),
            {:ok, s} <- wire_version(s),
-           {:ok, s} <- Mongo.Auth.run(opts, s) do
+           {:ok, s} <- maybe_auth(opts, s) do
+
         {mod, sock} = s.socket
         :ok = setopts(mod, sock, active: :once)
-        Mongo.Monitor.add_conn(self(), opts[:name], s.wire_version)
+
         {:ok, s}
       end
 
@@ -51,6 +53,14 @@ defmodule Mongo.Protocol do
         {:error, Mongo.Error.exception(tag: :tcp, action: "send", reason: reason)}
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp maybe_auth(opts, s) do
+    if opts[:skip_auth] do
+      {:ok, s}
+    else
+      Mongo.Auth.run(opts, s)
     end
   end
 
@@ -96,9 +106,9 @@ defmodule Mongo.Protocol do
     # wire version
     # https://github.com/mongodb/mongo/blob/master/src/mongo/db/wire_version.h
     case Utils.command(-1, [ismaster: 1], s) do
-      {:ok, %{"ok" => 1.0, "maxWireVersion" => version}} ->
+      {:ok, %{"ok" => ok, "maxWireVersion" => version}} when ok == 1 ->
         {:ok, %{s | wire_version: version}}
-      {:ok, %{"ok" => 1.0}} ->
+      {:ok, %{"ok" => ok}} when ok == 1 ->
         {:ok, %{s | wire_version: 0}}
       {:disconnect, _, _} = error ->
         error
@@ -157,8 +167,18 @@ defmodule Mongo.Protocol do
     handle_execute(query, params, opts, s)
   end
 
-  def handle_execute(%Mongo.Query{action: action, extra: extra}, params, opts, s) do
-    handle_execute(action, extra, params, opts, s)
+  def handle_execute(%Mongo.Query{action: action, extra: extra}, params, opts, original_state) do
+    {mod, sock} = original_state.socket
+    :ok = setopts(mod, sock, active: false)
+    tmp_state = %{original_state | database: Keyword.get(opts, :database, original_state.database)}
+    with {:ok, reply, tmp_state} <- handle_execute(action, extra, params, opts, tmp_state) do
+      :ok = setopts(mod, sock, active: :once)
+      {:ok, reply, Map.put(tmp_state, :database, original_state.database)}
+    end
+  end
+
+  defp handle_execute(:wire_version, _, _, _, s) do
+    {:ok, s.wire_version, s}
   end
 
   defp handle_execute(:find, coll, [query, select], opts, s) do
