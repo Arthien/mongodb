@@ -17,9 +17,11 @@ defmodule Mongo.PBKDF2 do
   @doc """
   Returns a derived key suitable for use.
   ## Options
-    * `:iterations` - defaults to 1000 (increase to at least 2^16 if used for passwords);
-    * `:length`     - a length in octets for the derived key. Defaults to 32;
-    * `:digest`     - an hmac function to use as the pseudo-random function. Defaults to `:sha256`;
+    * `:iterations` - defaults to 1000 (increase to at least 2^16 if used for
+      passwords)
+    * `:length` - a length in octets for the derived key. Defaults to 32
+    * `:digest` - an hmac function to use as the pseudo-random function.
+      Defaults to `:sha256`
   """
   def generate(secret, salt, opts \\ []) do
     iterations = Keyword.get(opts, :iterations, 1000)
@@ -34,17 +36,25 @@ defmodule Mongo.PBKDF2 do
   end
 
   defp generate(_fun, _salt, _iterations, max_length, _block_index, acc, length)
-      when length >= max_length do
-    key = acc |> Enum.reverse |> IO.iodata_to_binary
+       when length >= max_length do
+    key = acc |> Enum.reverse() |> IO.iodata_to_binary()
     <<bin::binary-size(max_length), _::binary>> = key
     bin
   end
 
   defp generate(fun, salt, iterations, max_length, block_index, acc, length) do
     initial = fun.(<<salt::binary, block_index::integer-size(32)>>)
-    block   = iterate(fun, iterations - 1, initial, initial)
-    generate(fun, salt, iterations, max_length, block_index + 1,
-             [block | acc], byte_size(block) + length)
+    block = iterate(fun, iterations - 1, initial, initial)
+
+    generate(
+      fun,
+      salt,
+      iterations,
+      max_length,
+      block_index + 1,
+      [block | acc],
+      byte_size(block) + length
+    )
   end
 
   defp iterate(_fun, 0, _prev, acc), do: acc

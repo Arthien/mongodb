@@ -9,28 +9,37 @@ defmodule Mongo.Cursor do
   @moduledoc false
 
   @type t :: %__MODULE__{
-    conn: Mongo.conn,
-    coll: Mongo.collection,
-    query: BSON.document,
-    select: BSON.document | nil,
-    opts: Keyword.t
-  }
+          conn: Mongo.conn(),
+          coll: Mongo.collection(),
+          query: BSON.document(),
+          select: BSON.document() | nil,
+          opts: Keyword.t()
+        }
   defstruct [:conn, :coll, :query, :select, :opts]
 
   defimpl Enumerable do
     defrecordp :state, [:conn, :cursor, :buffer, :limit]
 
-    def reduce(%{conn: conn, coll: coll, query: query, select: select, opts: opts},
-               acc, reduce_fun) do
-      limit      = opts[:limit]
-      opts       = Keyword.drop(opts, [:limit])
-      next_opts  = Keyword.drop(opts, [:limit, :skip])
+    def reduce(
+          %{conn: conn, coll: coll, query: query, select: select, opts: opts},
+          acc,
+          reduce_fun
+        ) do
+      limit = opts[:limit]
+      opts = Keyword.drop(opts, [:limit])
+      next_opts = Keyword.drop(opts, [:limit, :skip])
 
       start_fun = start_fun(conn, coll, query, select, limit, opts)
-      next_fun  = next_fun(coll, next_opts)
+      next_fun = next_fun(coll, next_opts)
       after_fun = after_fun(next_opts)
 
       Stream.resource(start_fun, next_fun, after_fun).(acc, reduce_fun)
+    end
+
+    # we cannot determinstically slice, so tell Enumerable to
+    # fall back on brute force
+    def slice(_cursor) do
+      {:error, __MODULE__}
     end
 
     defp start_fun(conn, coll, query, projector, limit, opts) do
@@ -42,6 +51,7 @@ defmodule Mongo.Cursor do
         case result do
           {:ok, %{cursor_id: cursor, docs: docs, num: num}} ->
             state(conn: conn, cursor: cursor, buffer: docs, limit: new_limit(limit, num))
+
           {:error, error} ->
             raise error
         end
@@ -62,12 +72,15 @@ defmodule Mongo.Cursor do
 
         state(buffer: [], limit: limit, conn: conn, cursor: cursor) = state ->
           opts = batch_size(limit, opts)
+          batch_size = Keyword.get(opts, :batch_size)
 
           case Mongo.get_more(conn, coll, cursor, opts) do
-            {:ok, %{cursor_id: cursor, docs: []}} ->
+            {:ok, %{"cursor" => %{"id" => cursor, "nextBatch" => []}}} ->
               {:halt, state(state, cursor: cursor)}
-            {:ok, %{cursor_id: cursor, docs: docs, num: num}} ->
-              {docs, state(state, cursor: cursor, limit: new_limit(limit, num))}
+
+            {:ok, %{"cursor" => %{"id" => cursor, "nextBatch" => docs}}} ->
+              {docs, state(state, cursor: cursor, limit: new_limit(limit, batch_size))}
+
             {:error, error} ->
               raise error
           end
@@ -81,6 +94,7 @@ defmodule Mongo.Cursor do
       fn
         state(cursor: 0) ->
           :ok
+
         state(cursor: cursor, conn: conn) ->
           Mongo.kill_cursors(conn, [cursor], opts)
       end
@@ -95,15 +109,20 @@ defmodule Mongo.Cursor do
     end
 
     defp batch_size(limit, opts) do
-      batch_size = Enum.reject([opts[:batch_size], limit, 1000], &is_nil/1) |> Enum.min
+      batch_size =
+        [opts[:batch_size], limit, 1_000]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.min()
+
       opts = Keyword.drop(opts, ~w(batch_size limit)a)
       [batch_size: batch_size] ++ opts
     end
 
     defp new_limit(nil, _),
       do: nil
+
     defp new_limit(limit, num),
-      do: limit-num
+      do: limit - num
   end
 end
 
@@ -111,24 +130,33 @@ defmodule Mongo.AggregationCursor do
   @moduledoc false
 
   @type t :: %__MODULE__{
-    conn: Mongo.conn,
-    coll: Mongo.collection,
-    query: BSON.document,
-    select: BSON.document | nil,
-    opts: Keyword.t
-  }
+          conn: Mongo.conn(),
+          coll: Mongo.collection(),
+          query: BSON.document(),
+          select: BSON.document() | nil,
+          opts: Keyword.t()
+        }
   defstruct [:conn, :coll, :query, :select, :opts]
 
   defimpl Enumerable do
     defrecordp :state, [:conn, :cursor, :coll, :buffer]
 
-    def reduce(%{conn: conn, coll: coll, query: query, select: select, opts: opts},
-               acc, reduce_fun) do
+    def reduce(
+          %{conn: conn, coll: coll, query: query, select: select, opts: opts},
+          acc,
+          reduce_fun
+        ) do
       start_fun = start_fun(conn, coll, query, select, opts)
-      next_fun  = next_fun(opts)
+      next_fun = next_fun(opts)
       after_fun = after_fun(opts)
 
       Stream.resource(start_fun, next_fun, after_fun).(acc, reduce_fun)
+    end
+
+    # we cannot determinstically slice, so tell Enumerable to
+    # fall back on brute force
+    def slice(_cursor) do
+      {:error, __MODULE__}
     end
 
     defp start_fun(conn, coll, query, projector, opts) do
@@ -136,8 +164,16 @@ defmodule Mongo.AggregationCursor do
 
       fn ->
         case Mongo.raw_find(conn, coll, query, projector, opts) do
-          {:ok, %{cursor_id: 0, docs: [%{"ok" => ok, "cursor" => %{"id" => cursor, "ns" => coll, "firstBatch" => docs}}]}} when ok == 1->
+          {:ok,
+           %{
+             cursor_id: 0,
+             docs: [
+               %{"ok" => ok, "cursor" => %{"id" => cursor, "ns" => coll, "firstBatch" => docs}}
+             ]
+           }}
+          when ok == 1 ->
             state(conn: conn, cursor: cursor, coll: only_coll(coll), buffer: docs)
+
           {:error, error} ->
             raise error
         end
@@ -151,10 +187,12 @@ defmodule Mongo.AggregationCursor do
 
         state(buffer: [], conn: conn, cursor: cursor, coll: coll) = state ->
           case Mongo.get_more(conn, coll, cursor, opts) do
-            {:ok, %{cursor_id: cursor, docs: []}} ->
+            {:ok, %{"cursor" => %{"id" => cursor, "nextBatch" => []}}} ->
               {:halt, state(state, cursor: cursor)}
-            {:ok, %{cursor_id: cursor, docs: docs}} ->
+
+            {:ok, %{"cursor" => %{"id" => cursor, "nextBatch" => docs}}} ->
               {docs, state(state, cursor: cursor)}
+
             {:error, error} ->
               raise error
           end
@@ -168,6 +206,7 @@ defmodule Mongo.AggregationCursor do
       fn
         state(cursor: 0) ->
           :ok
+
         state(cursor: cursor, conn: conn) ->
           Mongo.kill_cursors(conn, [cursor], opts)
       end
@@ -176,61 +215,6 @@ defmodule Mongo.AggregationCursor do
     defp only_coll(coll) do
       [_db, coll] = String.split(coll, ".", parts: 2)
       coll
-    end
-
-    def count(_stream) do
-      {:error, __MODULE__}
-    end
-
-    def member?(_stream, _term) do
-      {:error, __MODULE__}
-    end
-  end
-end
-
-defmodule Mongo.SinglyCursor do
-  @moduledoc false
-
-  @type t :: %__MODULE__{
-    conn: Mongo.conn,
-    coll: Mongo.collection,
-    query: BSON.document,
-    select: BSON.document | nil,
-    opts: Keyword.t
-  }
-  defstruct [:conn, :coll, :query, :select, :opts]
-
-  defimpl Enumerable do
-    def reduce(%{conn: conn, coll: coll, query: query, select: select, opts: opts},
-               acc, reduce_fun) do
-      opts      = Keyword.put(opts, :batch_size, -1)
-      start_fun = start_fun(conn, coll, query, select, opts)
-      next_fun  = next_fun()
-      after_fun = after_fun()
-
-      Stream.resource(start_fun, next_fun, after_fun).(acc, reduce_fun)
-    end
-
-    defp start_fun(conn, coll, query, projector, opts) do
-      fn ->
-        case Mongo.raw_find(conn, coll, query, projector, opts) do
-          {:ok, %{cursor_id: 0, docs: [%{"ok" => ok, "result" => docs}]}} when ok == 1 ->
-            docs
-          {:error, error} ->
-            raise error
-        end
-      end
-    end
-
-    defp next_fun do
-      fn
-        [] -> {:halt, :ok}
-        docs -> {docs, []}
-      end
-    end
-
-    defp after_fun do
-      fn _ -> :ok end
     end
 
     def count(_stream) do
